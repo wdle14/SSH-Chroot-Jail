@@ -44,7 +44,7 @@ for l in /lib/x86_64-linux-gnu/libnss_{dns,files}.so.* /lib/x86_64-linux-gnu/lib
   [ -e "$l" ] && cp --remove-destination --parents -L "$l" "$J"
 done
 
-# Docker CLI + plugin (compose, buildx). Binary asli disembunyikan, "docker" = wrapper whitelist.
+# Docker CLI + plugin (compose, buildx). Binary asli disembunyikan, "docker" = wrapper (socket + --gpus).
 mkdir -p "$J/usr/libexec/docker"
 cp -a --remove-destination --parents /usr/libexec/docker/cli-plugins "$J"
 cp --remove-destination -L /usr/bin/docker "$J/usr/libexec/docker/docker-real"
@@ -52,13 +52,28 @@ for p in /usr/bin/docker /usr/libexec/docker/cli-plugins/*; do
   # docker-buildx binary statis: grep kosong -> exit 1 -> set -e mati. Makanya "|| true".
   { ldd "$p" 2>/dev/null | grep -o '/[^ ]*' || true; } | while read -r l; do [ -e "$l" ] && cp --remove-destination --parents -L "$l" "$J" || true; done
 done
-cat > "$J/usr/bin/docker" <<EOF
+cat > "$J/usr/bin/docker" <<'EOF'
 #!/bin/bash
-# ponytail: whitelist level CLI saja, bukan batas keamanan (lihat catatan rootless)
-export DOCKER_HOST=unix:///home/$U/.docker-run/docker.sock TMPDIR=\$HOME/.tmp
-mkdir -p "\$TMPDIR"
-case "\$1" in ps|start|stop|compose|build) exec /usr/libexec/docker/docker-real "\$@";; esac
-echo "docker \$1: tidak diizinkan (hanya: ps start stop compose build)" >&2; exit 1
+# Semua perintah boleh: batas keamanan = daemon rootless (hak sebatas user), bukan wrapper ini.
+export DOCKER_HOST=unix://$HOME/.docker-run/docker.sock TMPDIR=$HOME/.tmp
+mkdir -p "$TMPDIR"
+# --gpus pakai hook legacy (gagal di rootless + cgroup v1). Terjemahkan ke CDI.
+# ponytail: --gpus di argumen command container (setelah image) ikut diterjemahkan.
+a=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --gpus) g=${2-}; shift 2 || shift;;
+    --gpus=*) g=${1#--gpus=}; shift;;
+    *) a+=("$1"); shift; continue;;
+  esac
+  g=${g//\"/}
+  if [ "$g" = all ]; then ids=all
+  elif [[ $g =~ ^[0-9]+$ ]]; then ids=$(seq -s, 0 $((g - 1)))   # angka polos = jumlah GPU
+  else ids=${g#device=}; fi                                      # device=0,1 = ID/UUID
+  IFS=, read -ra ids <<< "$ids"
+  for i in "${ids[@]}"; do a+=(--device "nvidia.com/gpu=$i"); done
+done
+exec /usr/libexec/docker/docker-real "${a[@]}"
 EOF
 chmod 755 "$J/usr/bin/docker"
 
@@ -95,6 +110,8 @@ pkill -u "$U" sshd || true
 
 # 8. Docker rootless: daemon jalan sebagai $U (bukan root), di luar jail.
 #    Socket ditaruh di home supaya kelihatan dari dalam jail.
+#    GPU lewat CDI (--device nvidia.com/gpu=all), bukan --gpus: hook legacy perlu tulis
+#    devices cgroup v1, rootless tidak boleh. Spec /var/run/cdi diurus nvidia-cdi-refresh.
 UID_U=$(id -u "$U")
 command -v newuidmap >/dev/null || apt-get install -y uidmap
 loginctl enable-linger "$U"
@@ -102,7 +119,7 @@ systemctl start "user@$UID_U"
 AS_U="sudo -u $U HOME=/home/$U XDG_RUNTIME_DIR=/run/user/$UID_U DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$UID_U/bus"
 $AS_U bash -c 'cd ~; [ -f ~/.config/systemd/user/docker.service ] || dockerd-rootless-setuptool.sh install'
 $AS_U bash -c "mkdir -p ~/.config/docker ~/.docker-run
-  echo '{\"hosts\":[\"unix:///home/$U/.docker-run/docker.sock\"]}' > ~/.config/docker/daemon.json
+  echo '{\"hosts\":[\"unix:///home/$U/.docker-run/docker.sock\"],\"features\":{\"cdi\":true}}' > ~/.config/docker/daemon.json
   systemctl --user restart docker"
 sleep 3
 
@@ -112,4 +129,5 @@ for h in /home/*; do [ "$h" = "/home/$U" ] || chmod o-rwx "$h"; done
 # Self-check: harus cuma lihat isi jail, docker jalan, perintah lain ditolak
 env -i HOME=/home/$U PATH=/usr/bin:/bin /usr/sbin/chroot --userspec="$U:$U" "$J" /bin/bash -c '
   ls / && ls /home && python3 -c "import json,ssl" && git --version &&
-  docker ps && docker compose version && ! docker run hello-world 2>/dev/null && echo JAIL_OK'
+  docker ps && docker compose version && docker run --rm hello-world >/dev/null &&
+  echo JAIL_OK'
